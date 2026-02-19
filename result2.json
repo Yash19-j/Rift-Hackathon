@@ -911,7 +911,7 @@
   ],
   "summary": {
     "fraud_rings_detected": 74,
-    "processing_time_seconds": 13.7,
+    "processing_time_seconds": 13.3,
     "suspicious_accounts_flagged": 318,
     "total_accounts_analyzed": 4134
   },

@@ -3,9 +3,23 @@ Money Muling Detection Backend
 ==============================
 A Flask application that accepts CSV transaction data, builds a directed
 transaction graph with NetworkX, and runs three fraud-detection algorithms:
-  1. Cycle Detection (DFS, length 3-5)
-  2. Smurfing / Fan-in & Fan-out
-  3. Shell Network Detection
+  1. Cycle Detection (SCC-filtered, DFS, length 3-5)
+  2. Smurfing / Fan-in & Fan-out (int64 timestamps + sliding counter)
+  3. Shell Network Detection (DFS chain-walk)
+
+Performance optimisations applied (v2):
+  • Timestamps converted to int64 nanoseconds once upfront; all window
+    comparisons use integer arithmetic — avoids millions of pd.Timestamp()
+    object instantiations inside inner loops.
+  • Sliding-window unique-counter uses collections.defaultdict(int) that
+    increments / decrements as the window slides — true O(N) per group
+    instead of set(slice) which was O(N²).
+  • Cycle detection pre-filters the graph to strongly connected components
+    (SCCs) with ≥3 nodes and removes leaf nodes (in_degree=0 or
+    out_degree=0) that can never participate in cycles.
+  • Inverted index account_cycle_patterns built during cycle processing
+    so that per-account pattern lookup is O(1) instead of scanning all
+    cycles for every suspicious account.
 
 Each flagged account receives a suspicion score (0-100) and is grouped into
 fraud rings where applicable.
@@ -14,12 +28,13 @@ fraud rings where applicable.
 import io
 import time
 import json
-from datetime import timedelta
+from collections import defaultdict
 
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import pandas as pd
 import networkx as nx
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Flask application setup
@@ -48,7 +63,7 @@ def build_graph(df: pd.DataFrame) -> nx.DiGraph:
     Construct a directed graph from the transaction DataFrame.
 
     Each unique account (sender or receiver) becomes a node.
-    Each transaction becomes a directed edge carrying amount and timestamp.
+    Each transaction becomes a directed edge.
 
     Time complexity: O(E) where E = number of transaction rows.
     Uses vectorized edge construction instead of iterrows for speed.
@@ -60,27 +75,127 @@ def build_graph(df: pd.DataFrame) -> nx.DiGraph:
 
 
 # ===========================================================================
-# 2. CYCLE DETECTION  (length 3-5, DFS-based)
+# 2. CYCLE DETECTION  (SCC-filtered, length 3-5)
 # ===========================================================================
+
+_MAX_CYCLES = 500          # Hard cap on total cycles returned
+_SMALL_SCC_THRESHOLD = 100  # SCCs ≤ this size get exhaustive search
+_TIME_BUDGET = 1.0          # Max seconds for cycle detection
+
+
+def _find_short_cycles_local(G, node, length_bound=5):
+    """
+    Fast local search: find all simple cycles of length 3..length_bound
+    passing through 'node' by doing a DFS from node's successors and
+    checking if any path returns to 'node' within length_bound steps.
+
+    This is O(d^length_bound) per node where d = avg out-degree in the
+    local neighborhood — fast for the sparse subgraphs typical of
+    financial transaction networks.
+    """
+    cycles = []
+    target = node
+
+    def _dfs(current, path, depth):
+        if depth >= length_bound:
+            return
+        for nxt in G.successors(current):
+            if nxt == target and len(path) >= 3:
+                cycles.append(list(path))
+            elif nxt not in path and depth + 1 < length_bound:
+                path.add(nxt)
+                _dfs(nxt, path, depth + 1)
+                path.discard(nxt)
+
+    for succ in G.successors(node):
+        if succ == target:
+            continue
+        _dfs(succ, {node, succ}, 2)
+
+    return cycles
+
 
 def detect_cycles(G: nx.DiGraph) -> list[list[str]]:
     """
-    Find all simple cycles of length 3, 4, or 5 using DFS.
+    Find simple cycles of length 3, 4, or 5.
 
-    NetworkX's simple_cycles uses Johnson's algorithm internally.
-    We pass length_bound=5 so the algorithm ONLY enumerates cycles up to
-    length 5, avoiding the combinatorial explosion of longer cycles.
+    Hybrid strategy for guaranteed sub-second performance:
 
-    Time complexity: O((V + E) * (C + 1))  where C = number of elementary
-    circuits of length ≤ 5.  The length_bound makes this tractable even for
-    graphs with thousands of nodes.
+      1. Iterative leaf pruning — remove nodes with in_degree=0 or
+         out_degree=0 (can never be in any cycle).
+      2. SCC decomposition — cycles only exist within strongly
+         connected components.
+      3. For small SCCs (≤100 nodes): exhaustive nx.simple_cycles
+         with length_bound=5.
+      4. For large SCCs (>100 nodes): fast local DFS search from
+         each node, finding short cycles through that node's
+         neighborhood.  Capped by _MAX_CYCLES (500) and
+         _TIME_BUDGET (1 second).
+      5. Global deduplication via frozenset to avoid reporting the
+         same cycle found from different starting nodes.
 
     Returns a list of cycles, each cycle being a list of account IDs.
     """
+    import time as _time
+    t_start = _time.perf_counter()
+
+    # Step 1: iterative leaf pruning
+    pruned = G.copy()
+    changed = True
+    while changed:
+        changed = False
+        to_remove = [
+            n for n in pruned.nodes()
+            if pruned.in_degree(n) == 0 or pruned.out_degree(n) == 0
+        ]
+        if to_remove:
+            pruned.remove_nodes_from(to_remove)
+            changed = True
+
+    if pruned.number_of_nodes() == 0:
+        return []
+
     cycles = []
-    for cycle in nx.simple_cycles(G, length_bound=5):
-        if len(cycle) >= 3:
-            cycles.append(cycle)
+    seen = set()  # frozensets for dedup
+    budget = _MAX_CYCLES
+
+    def _add_cycle(c):
+        nonlocal budget
+        key = frozenset(c)
+        if key not in seen:
+            seen.add(key)
+            cycles.append(c)
+            budget -= 1
+
+    # Step 2 & 3/4: process each SCC
+    for scc_nodes in nx.strongly_connected_components(pruned):
+        if len(scc_nodes) < 3 or budget <= 0:
+            continue
+
+        elapsed = _time.perf_counter() - t_start
+        if elapsed > _TIME_BUDGET:
+            break
+
+        sub = pruned.subgraph(scc_nodes)
+
+        if len(scc_nodes) <= _SMALL_SCC_THRESHOLD:
+            # Exhaustive search for small SCCs — fast enough
+            for cycle in nx.simple_cycles(sub, length_bound=5):
+                if len(cycle) >= 3:
+                    _add_cycle(cycle)
+                    if budget <= 0:
+                        break
+        else:
+            # Large SCC: local DFS from each node
+            for node in sub.nodes():
+                if budget <= 0 or (_time.perf_counter() - t_start) > _TIME_BUDGET:
+                    break
+                local_cycles = _find_short_cycles_local(sub, node)
+                for c in local_cycles:
+                    _add_cycle(list(c))
+                    if budget <= 0:
+                        break
+
     return cycles
 
 
@@ -88,54 +203,101 @@ def detect_cycles(G: nx.DiGraph) -> list[list[str]]:
 # 3. SMURFING DETECTION  (Fan-in / Fan-out within 72 hours)
 # ===========================================================================
 
+# 72 hours expressed in nanoseconds (int64 arithmetic)
+_72H_NS = int(72 * 3600 * 1e9)
+# 24 hours in nanoseconds
+_24H_NS = int(24 * 3600 * 1e9)
+
+
 def detect_smurfing(df: pd.DataFrame) -> dict:
     """
-    Detect fan-in and fan-out patterns using Pandas timestamp windowing.
+    Detect fan-in and fan-out patterns using a sliding window over
+    int64-nanosecond timestamps with a defaultdict counter for O(1)
+    window maintenance.
 
     Fan-in:  ≥10 distinct senders  → 1 receiver within any 72-hour window.
     Fan-out: 1 sender → ≥10 distinct receivers within any 72-hour window.
 
-    Approach:
-      • Sort by timestamp.
-      • For each receiver (fan-in) or sender (fan-out), use a 72-hour
-        rolling window and count distinct counterparties.
+    Optimisations vs. previous version:
+      • Timestamps are pre-converted to int64 nanoseconds once via
+        .astype("int64") — all comparisons are simple integer subtractions
+        instead of pd.Timestamp() object construction.
+      • The unique-counterparty count uses a defaultdict(int) that
+        increments when the right pointer advances and decrements when
+        the left pointer advances.  A separate 'distinct' counter tracks
+        the number of keys with count > 0.  This gives true O(N) per
+        group instead of O(N²) from set(slice).
 
-    Time complexity: O(E * log E) for sorting + O(E) for the groupby scans,
-    so overall O(E log E) where E = number of transactions.
+    Time complexity: O(E log E) for the initial sort + O(E) for the
+    sliding-window scan, overall O(E log E).
 
     Returns {"fan_in_nodes": set, "fan_out_nodes": set}.
     """
-    WINDOW = timedelta(hours=72)
     fan_in_nodes: set[str] = set()
     fan_out_nodes: set[str] = set()
 
     df_sorted = df.sort_values("timestamp")
+    ts_int = df_sorted["timestamp"].astype("int64").values  # nanosecond ints
+
+    # Re-index the other columns to match sorted order
+    sender_vals = df_sorted["sender_id"].values
+    receiver_vals = df_sorted["receiver_id"].values
+
+    # Build per-receiver index arrays for fan-in
+    recv_groups = df_sorted.groupby("receiver_id").indices
+    send_groups = df_sorted.groupby("sender_id").indices
 
     # --- Fan-in: many senders → one receiver ---
-    for receiver, group in df_sorted.groupby("receiver_id"):
-        timestamps = group["timestamp"].values
-        senders = group["sender_id"].values
-        n = len(group)
+    for receiver, idxs in recv_groups.items():
+        ts = ts_int[idxs]
+        senders = sender_vals[idxs]
+        n = len(idxs)
+        counter = defaultdict(int)
+        distinct = 0
         left = 0
+        flagged = False
         for right in range(n):
-            while pd.Timestamp(timestamps[right]) - pd.Timestamp(timestamps[left]) > WINDOW:
+            # Add right element
+            s = senders[right]
+            if counter[s] == 0:
+                distinct += 1
+            counter[s] += 1
+
+            # Shrink window from left
+            while ts[right] - ts[left] > _72H_NS:
+                s_left = senders[left]
+                counter[s_left] -= 1
+                if counter[s_left] == 0:
+                    distinct -= 1
                 left += 1
-            unique_senders = set(senders[left : right + 1])
-            if len(unique_senders) >= 10:
+
+            if distinct >= 10:
                 fan_in_nodes.add(receiver)
-                break  # already flagged
+                flagged = True
+                break
 
     # --- Fan-out: one sender → many receivers ---
-    for sender, group in df_sorted.groupby("sender_id"):
-        timestamps = group["timestamp"].values
-        receivers = group["receiver_id"].values
-        n = len(group)
+    for sender, idxs in send_groups.items():
+        ts = ts_int[idxs]
+        receivers = receiver_vals[idxs]
+        n = len(idxs)
+        counter = defaultdict(int)
+        distinct = 0
         left = 0
         for right in range(n):
-            while pd.Timestamp(timestamps[right]) - pd.Timestamp(timestamps[left]) > WINDOW:
+            r = receivers[right]
+            if counter[r] == 0:
+                distinct += 1
+            counter[r] += 1
+
+            while ts[right] - ts[left] > _72H_NS:
+                r_left = receivers[left]
+                counter[r_left] -= 1
+                if counter[r_left] == 0:
+                    distinct -= 1
                 left += 1
-            unique_receivers = set(receivers[left : right + 1])
-            if len(unique_receivers) >= 10:
+
+            if distinct >= 10:
                 fan_out_nodes.add(sender)
                 break
 
@@ -202,7 +364,7 @@ def detect_shell_networks(G: nx.DiGraph) -> set[str]:
 
 
 # ===========================================================================
-# 5. HIGH VELOCITY CHECK
+# 5. HIGH VELOCITY CHECK  (int64 sliding window)
 # ===========================================================================
 
 def detect_high_velocity(df: pd.DataFrame) -> set[str]:
@@ -210,23 +372,29 @@ def detect_high_velocity(df: pd.DataFrame) -> set[str]:
     Flag accounts with >10 transactions (sent or received) within any
     24-hour window.
 
+    Optimisation: uses pre-computed int64 nanosecond timestamps for
+    integer comparison instead of constructing pd.Timestamp objects
+    inside the inner loop.
+
     Time complexity: O(E log E) for sorting + O(E) for the sliding-window
     scan per account.
 
     Returns a set of high-velocity account IDs.
     """
-    WINDOW = timedelta(hours=24)
     high_vel: set[str] = set()
     df_sorted = df.sort_values("timestamp")
+    ts_int = df_sorted["timestamp"].astype("int64").values
 
     # Check both sender and receiver activity
     for role in ["sender_id", "receiver_id"]:
-        for account, group in df_sorted.groupby(role):
-            timestamps = group["timestamp"].values
-            n = len(group)
+        groups = df_sorted.groupby(role).indices
+        role_vals = df_sorted[role].values
+        for account, idxs in groups.items():
+            ts = ts_int[idxs]
+            n = len(idxs)
             left = 0
             for right in range(n):
-                while pd.Timestamp(timestamps[right]) - pd.Timestamp(timestamps[left]) > WINDOW:
+                while ts[right] - ts[left] > _24H_NS:
                     left += 1
                 if (right - left + 1) > 10:
                     high_vel.add(account)
@@ -302,10 +470,15 @@ def compute_scores(
 def run_analysis(df: pd.DataFrame) -> dict:
     """
     Orchestrate all detection algorithms and build the output JSON.
+
+    Key optimisation: builds an inverted index (account_cycle_patterns)
+    during cycle processing so that per-account pattern lookup is O(1)
+    instead of looping over ALL cycles for every suspicious account.
     """
     start = time.time()
 
-    # --- Parse timestamps ---
+    # --- Parse timestamps once (int64 conversion happens inside each
+    #     detector to avoid redundant work) ---
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
     # --- Build graph ---
@@ -319,29 +492,31 @@ def run_analysis(df: pd.DataFrame) -> dict:
     high_vel = detect_high_velocity(df)
     merchants = get_merchant_accounts(df)
 
-    # Flatten cycle accounts and build ring mappings
+    # Flatten cycle accounts and build ring mappings + INVERTED INDEX
     cycle_accounts: set[str] = set()
-    # Map account → list of ring IDs it belongs to
     account_rings: dict[str, list[str]] = {}
+    # Inverted index: account → set of pattern strings (e.g. "cycle_length_3")
+    account_cycle_patterns: dict[str, list[str]] = defaultdict(list)
     fraud_rings: list[dict] = []
 
     for idx, cycle in enumerate(cycles, start=1):
         ring_id = f"RING_{idx:03d}"
         ring_members = [str(a) for a in cycle]
+        pattern_label = f"cycle_length_{len(cycle)}"
 
-        # Compute ring risk score = average individual score of members
-        # (we'll update this after scoring)
         fraud_rings.append(
             {
                 "ring_id": ring_id,
                 "member_accounts": ring_members,
-                "pattern_type": f"cycle_length_{len(cycle)}",
+                "pattern_type": pattern_label,
                 "risk_score": 0.0,  # placeholder, computed below
             }
         )
         for acct in cycle:
             cycle_accounts.add(acct)
             account_rings.setdefault(acct, []).append(ring_id)
+            # Build inverted index — O(1) lookup later
+            account_cycle_patterns[acct].append(pattern_label)
 
     fan_in_out_accounts = smurfing["fan_in_nodes"] | smurfing["fan_out_nodes"]
 
@@ -359,13 +534,13 @@ def run_analysis(df: pd.DataFrame) -> dict:
         )
 
     # --- Build suspicious accounts list ---
+    # Uses the inverted index for O(1) cycle pattern lookup per account
     suspicious_accounts: list[dict] = []
     for acct, score in sorted(scores.items(), key=lambda x: -x[1]):
         patterns: list[str] = []
-        # Which cycle lengths?
-        for cycle in cycles:
-            if acct in cycle:
-                patterns.append(f"cycle_length_{len(cycle)}")
+        # O(1) lookup from inverted index instead of scanning all cycles
+        if acct in account_cycle_patterns:
+            patterns.extend(account_cycle_patterns[acct])
         if acct in smurfing["fan_in_nodes"]:
             patterns.append("fan_in")
         if acct in smurfing["fan_out_nodes"]:
@@ -396,7 +571,6 @@ def run_analysis(df: pd.DataFrame) -> dict:
             continue
         ring_counter += 1
         ring_id = f"RING_{ring_counter:03d}"
-        # Collect the senders that sent to this node
         senders = df[df["receiver_id"] == node]["sender_id"].unique().tolist()
         members = [str(node)] + [str(s) for s in senders if s not in merchants]
         member_scores = [scores.get(str(m), 0.0) for m in members]
